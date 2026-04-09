@@ -1,5 +1,8 @@
 checkpoints/
 output/
 runs/
+data/
+embeddings/
 __pycache__/
 *.pyc
+*.bin

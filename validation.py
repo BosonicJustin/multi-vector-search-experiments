@@ -1,36 +1,52 @@
+import csv
 import torch
 import torch.nn.functional as F
 import numpy as np
+from collections import defaultdict
 
 from scoring import maxsim
 
 
-K_VALUES = [5, 50, 100]
 ENCODE_BATCH_SIZE = 64
 SCORE_BATCH_SIZE = 64
 
 
-def dcg_at_k(relevances, k):
-    rel = np.array(relevances[:k], dtype=np.float64)
-    positions = np.arange(1, len(rel) + 1)
-    return np.sum(rel / np.log2(positions + 1))
+def load_queries(path):
+    queries = {}
+    with open(path) as f:
+        for row in csv.reader(f, delimiter="\t"):
+            queries[row[0]] = row[1]
+    return queries
 
 
-def ndcg_at_k(relevances, k):
-    actual = dcg_at_k(relevances, k)
-    ideal = dcg_at_k(sorted(relevances, reverse=True), k)
-    if ideal == 0:
-        return 0.0
-    return actual / ideal
+def load_qrels(path):
+    qrels = defaultdict(set)
+    with open(path) as f:
+        for row in csv.reader(f, delimiter="\t"):
+            qid, _, pid, label = row
+            if int(label) > 0:
+                qrels[qid].add(pid)
+    return qrels
 
 
-def encode_texts(encoder, texts, batch_size):
+def load_top1000(path, qids=None):
+    top1000 = defaultdict(list)
+    with open(path) as f:
+        for row in csv.reader(f, delimiter="\t"):
+            qid, pid, query_text, passage_text = row
+            if qids and qid not in qids:
+                continue
+            top1000[qid].append({"pid": pid, "passage": passage_text})
+    return top1000
+
+
+def encode_texts(encoder, encode_fn, texts, batch_size):
     chunks = []
     mask_chunks = []
     max_len = 0
 
     for i in range(0, len(texts), batch_size):
-        embs, mask = encoder(texts[i:i + batch_size])
+        embs, mask = encode_fn(texts[i:i + batch_size])
         chunks.append(embs)
         mask_chunks.append(mask)
         max_len = max(max_len, embs.size(1))
@@ -44,81 +60,82 @@ def encode_texts(encoder, texts, batch_size):
     return torch.cat(chunks), torch.cat(mask_chunks)
 
 
-def validate(query_encoder, doc_encoder, val_loader, device, max_batches=None):
-    query_encoder.eval()
-    doc_encoder.eval()
+RECALL_KS = [50, 200, 1000]
 
-    all_queries = []
-    doc_pool = []
-    doc_text_to_idx = {}
-    query_relevant_docs = []
 
-    for batch_idx, batch in enumerate(val_loader):
-        if max_batches and batch_idx >= max_batches:
-            break
-        for i in range(len(batch["queries"])):
-            query = batch["queries"][i]
-            positive = batch["positives"][i]
-            negatives = batch["negative_lists"][i]
+def mrr_at_k(ranked_pids, relevant_pids, k=10):
+    for i, pid in enumerate(ranked_pids[:k]):
+        if pid in relevant_pids:
+            return 1.0 / (i + 1)
+    return 0.0
 
-            all_queries.append(query)
 
-            if positive not in doc_text_to_idx:
-                doc_text_to_idx[positive] = len(doc_pool)
-                doc_pool.append(positive)
+def recall_at_k(ranked_pids, relevant_pids, k):
+    top_k = set(ranked_pids[:k])
+    return len(top_k & relevant_pids) / len(relevant_pids)
 
-            for neg in negatives:
-                if neg not in doc_text_to_idx:
-                    doc_text_to_idx[neg] = len(doc_pool)
-                    doc_pool.append(neg)
 
-            query_relevant_docs.append({doc_text_to_idx[positive]})
+def dcg_at_k(ranked_pids, relevant_pids, k):
+    dcg = 0.0
+    for i, pid in enumerate(ranked_pids[:k]):
+        rel = 1.0 if pid in relevant_pids else 0.0
+        dcg += rel / np.log2(i + 2)
+    return dcg
 
-    n_queries = len(all_queries)
-    n_docs = len(doc_pool)
-    print(f"Validation: {n_queries} queries, {n_docs} unique documents")
+
+def ndcg_at_k(ranked_pids, relevant_pids, k):
+    actual = dcg_at_k(ranked_pids, relevant_pids, k)
+    ideal_pids = list(relevant_pids) + [p for p in ranked_pids if p not in relevant_pids]
+    ideal = dcg_at_k(ideal_pids, relevant_pids, k)
+    if ideal == 0:
+        return 0.0
+    return actual / ideal
+
+
+def validate(encoder, device, queries_path, qrels_path, top1000_path, max_queries=None):
+    encoder.eval()
+
+    queries = load_queries(queries_path)
+    qrels = load_qrels(qrels_path)
+
+    eval_qids = [qid for qid in qrels if qid in queries]
+    if max_queries:
+        eval_qids = eval_qids[:max_queries]
+
+    top1000 = load_top1000(top1000_path, qids=set(eval_qids))
+    eval_qids = [qid for qid in eval_qids if qid in top1000]
+
+    print(f"Validation: {len(eval_qids)} queries")
+
+    all_mrr = []
+    all_recall = {k: [] for k in RECALL_KS}
+    all_ndcg = {k: [] for k in RECALL_KS}
 
     with torch.no_grad():
-        query_embs, _ = encode_texts(query_encoder, all_queries, ENCODE_BATCH_SIZE)
-        doc_embs, doc_masks = encode_texts(doc_encoder, doc_pool, ENCODE_BATCH_SIZE)
+        for qid in eval_qids:
+            query_text = queries[qid]
+            candidates = top1000[qid]
+            relevant_pids = qrels[qid]
 
-        all_scores = torch.zeros(n_queries, n_docs, device=device)
+            passage_texts = [c["passage"] for c in candidates]
+            pids = [c["pid"] for c in candidates]
 
-        for q_start in range(0, n_queries, SCORE_BATCH_SIZE):
-            q_end = min(q_start + SCORE_BATCH_SIZE, n_queries)
-            q_batch = query_embs[q_start:q_end]
-            q_size = q_end - q_start
+            query_embs, _ = encoder.encode_queries([query_text])
+            doc_embs, doc_masks = encode_texts(encoder, encoder.encode_documents, passage_texts, ENCODE_BATCH_SIZE)
 
-            for d_start in range(0, n_docs, SCORE_BATCH_SIZE):
-                d_end = min(d_start + SCORE_BATCH_SIZE, n_docs)
-                d_batch = doc_embs[d_start:d_end]
-                dm_batch = doc_masks[d_start:d_end]
-                d_size = d_end - d_start
+            q_exp = query_embs.expand(len(passage_texts), -1, -1)
+            scores = maxsim(q_exp, doc_embs, doc_masks)
 
-                q_exp = q_batch.unsqueeze(1).expand(-1, d_size, -1, -1).reshape(-1, q_batch.size(1), q_batch.size(2))
-                d_exp = d_batch.unsqueeze(0).expand(q_size, -1, -1, -1).reshape(-1, d_batch.size(1), d_batch.size(2))
-                dm_exp = dm_batch.unsqueeze(0).expand(q_size, -1, -1).reshape(-1, dm_batch.size(1))
+            ranked_indices = torch.argsort(scores, descending=True).cpu().tolist()
+            ranked_pids = [pids[i] for i in ranked_indices]
 
-                scores = maxsim(q_exp, d_exp, dm_exp).view(q_size, d_size)
-                all_scores[q_start:q_end, d_start:d_end] = scores
+            all_mrr.append(mrr_at_k(ranked_pids, relevant_pids, k=10))
+            for k in RECALL_KS:
+                all_recall[k].append(recall_at_k(ranked_pids, relevant_pids, k))
+                all_ndcg[k].append(ndcg_at_k(ranked_pids, relevant_pids, k))
 
-    labels = torch.tensor([list(rel)[0] for rel in query_relevant_docs], device=device)
-    val_loss = F.cross_entropy(all_scores, labels).item()
-
-    all_metrics = {f"{m}@{k}": [] for k in K_VALUES for m in ["recall", "precision", "ndcg"]}
-    all_metrics["loss"] = val_loss
-    all_scores_np = all_scores.cpu().numpy()
-
-    for i in range(n_queries):
-        relevant = query_relevant_docs[i]
-        ranked_indices = np.argsort(-all_scores_np[i])
-        relevances = [1 if idx in relevant else 0 for idx in ranked_indices]
-
-        for k in K_VALUES:
-            top_k = set(ranked_indices[:k].tolist())
-            hits = len(top_k & relevant)
-            all_metrics[f"recall@{k}"].append(hits / len(relevant))
-            all_metrics[f"precision@{k}"].append(hits / k)
-            all_metrics[f"ndcg@{k}"].append(ndcg_at_k(relevances, k))
-
-    return {key: np.mean(vals) for key, vals in all_metrics.items() if vals}
+    metrics = {"MRR@10": np.mean(all_mrr)}
+    for k in RECALL_KS:
+        metrics[f"Recall@{k}"] = np.mean(all_recall[k])
+        metrics[f"NDCG@{k}"] = np.mean(all_ndcg[k])
+    return metrics
